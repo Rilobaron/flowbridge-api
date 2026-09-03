@@ -6,6 +6,92 @@ import {
   HTTP_METHODS,
 } from "../constants/index.js";
 
+const destinationAuthSchema = new mongoose.Schema(
+  {
+    type: {
+      type: String,
+      enum: Object.values(OUTBOUND_AUTH_TYPE),
+      default: OUTBOUND_AUTH_TYPE.NONE,
+    },
+    token: {
+      type: String,
+      default: null,
+    },
+    username: {
+      type: String,
+      default: null,
+    },
+    password: {
+      type: String,
+      default: null,
+    },
+    apiKey: {
+      type: String,
+      default: null,
+    },
+    apiKeyHeader: {
+      type: String,
+      default: "X-API-Key",
+    },
+    // Suporte a OAuth2
+    tokenUrl: {
+      type: String,
+      default: null,
+    },
+    clientId: {
+      type: String,
+      default: null,
+    },
+    clientSecret: {
+      type: String,
+      default: null,
+    },
+    scope: {
+      type: String,
+      default: null,
+    },
+  },
+  { _id: false }
+);
+
+export const destinationSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      trim: true,
+      default: "primary",
+    },
+    url: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    method: {
+      type: String,
+      enum: HTTP_METHODS,
+      default: "POST",
+    },
+    headers: {
+      type: Map,
+      of: String,
+      default: {},
+    },
+    mapping: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    authentication: {
+      type: destinationAuthSchema,
+      default: () => ({}),
+    },
+    timeout: {
+      type: Number,
+      default: null,
+    },
+  },
+  { _id: true }
+);
+
 const integrationSchema = new mongoose.Schema(
   {
     name: {
@@ -53,55 +139,17 @@ const integrationSchema = new mongoose.Schema(
       },
       headerName: {
         type: String,
-        default: null, // Custom header para API Key ou HMAC (ex: x-signature)
+        default: null,
       },
     },
 
-    destination: {
-      url: {
-        type: String,
-        required: true,
-        trim: true,
-      },
-      method: {
-        type: String,
-        enum: HTTP_METHODS,
-        default: "POST",
-      },
-      headers: {
-        type: Map,
-        of: String,
-        default: {},
-      },
-      authentication: {
-        type: {
-          type: String,
-          enum: Object.values(OUTBOUND_AUTH_TYPE),
-          default: OUTBOUND_AUTH_TYPE.NONE,
-        },
-        token: {
-          type: String,
-          default: null,
-        },
-        username: {
-          type: String,
-          default: null,
-        },
-        password: {
-          type: String,
-          default: null,
-        },
-        apiKey: {
-          type: String,
-          default: null,
-        },
-        apiKeyHeader: {
-          type: String,
-          default: "X-API-Key",
-        },
-      },
+    // Suporte a múltiplos destinos (Fan-out)
+    destinations: {
+      type: [destinationSchema],
+      default: [],
     },
 
+    // Mapeamento global padrão (usado se o destino não tiver mapping específico)
     mapping: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
@@ -120,7 +168,7 @@ const integrationSchema = new mongoose.Schema(
       },
       initialDelay: {
         type: Number,
-        default: 1000, // em ms
+        default: 1000,
       },
       multiplier: {
         type: Number,
@@ -129,51 +177,79 @@ const integrationSchema = new mongoose.Schema(
       },
       maxDelay: {
         type: Number,
-        default: 60000, // 1 min max delay
+        default: 60000,
       },
     },
 
     timeout: {
       type: Number,
-      default: 5000, // 5 segundos
+      default: 5000,
       min: 500,
       max: 60000,
     },
   },
   {
     timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
   }
 );
 
+// Virtual para manter retrocompatibilidade com integration.destination
+integrationSchema.virtual("destination").get(function () {
+  return this.destinations && this.destinations.length > 0 ? this.destinations[0] : null;
+}).set(function (dest) {
+  if (dest) {
+    if (!this.destinations || this.destinations.length === 0) {
+      this.destinations = [dest];
+    } else {
+      this.destinations[0] = dest;
+    }
+  }
+});
+
 // Hook para criptografar secrets antes de salvar
 integrationSchema.pre("save", function () {
+  // 1. Inbound secret
   if (this.isModified("source.secret") && this.source?.secret) {
     this.source.secret = encrypt(this.source.secret);
   }
 
-  if (this.isModified("destination.authentication.token") && this.destination?.authentication?.token) {
-    this.destination.authentication.token = encrypt(this.destination.authentication.token);
-  }
-
-  if (this.isModified("destination.authentication.password") && this.destination?.authentication?.password) {
-    this.destination.authentication.password = encrypt(this.destination.authentication.password);
-  }
-
-  if (this.isModified("destination.authentication.apiKey") && this.destination?.authentication?.apiKey) {
-    this.destination.authentication.apiKey = encrypt(this.destination.authentication.apiKey);
+  // 2. Outbound secrets em cada destino
+  if (this.destinations && Array.isArray(this.destinations)) {
+    for (const dest of this.destinations) {
+      if (dest.authentication) {
+        if (dest.authentication.token && !dest.authentication.token.includes(":")) {
+          dest.authentication.token = encrypt(dest.authentication.token);
+        }
+        if (dest.authentication.password && !dest.authentication.password.includes(":")) {
+          dest.authentication.password = encrypt(dest.authentication.password);
+        }
+        if (dest.authentication.apiKey && !dest.authentication.apiKey.includes(":")) {
+          dest.authentication.apiKey = encrypt(dest.authentication.apiKey);
+        }
+        if (dest.authentication.clientSecret && !dest.authentication.clientSecret.includes(":")) {
+          dest.authentication.clientSecret = encrypt(dest.authentication.clientSecret);
+        }
+      }
+    }
   }
 });
 
-// Método para recuperar credenciais descriptografadas para execução do worker
-integrationSchema.methods.getDecryptedCredentials = function () {
-  const result = {
+// Método para recuperar credenciais descriptografadas de um destino específico
+integrationSchema.methods.getDecryptedCredentials = function (destinationIndex = 0) {
+  const dest = this.destinations && this.destinations[destinationIndex] ? this.destinations[destinationIndex] : this.destination;
+  const auth = dest?.authentication;
+
+  return {
     sourceSecret: this.source?.secret ? decrypt(this.source.secret) : null,
-    destinationToken: this.destination?.authentication?.token ? decrypt(this.destination.authentication.token) : null,
-    destinationPassword: this.destination?.authentication?.password ? decrypt(this.destination.authentication.password) : null,
-    destinationApiKey: this.destination?.authentication?.apiKey ? decrypt(this.destination.authentication.apiKey) : null,
-    destinationUsername: this.destination?.authentication?.username || null,
+    destinationToken: auth?.token ? decrypt(auth.token) : null,
+    destinationPassword: auth?.password ? decrypt(auth.password) : null,
+    destinationApiKey: auth?.apiKey ? decrypt(auth.apiKey) : null,
+    destinationClientSecret: auth?.clientSecret ? decrypt(auth.clientSecret) : null,
+    destinationUsername: auth?.username || null,
+    destinationClientId: auth?.clientId || null,
   };
-  return result;
 };
 
 // Oculta e mascara credenciais ao serializar para JSON nas respostas da API
@@ -184,11 +260,20 @@ integrationSchema.methods.toJSON = function () {
     obj.source.secret = maskSecret(obj.source.secret);
   }
 
-  if (obj.destination?.authentication) {
-    const auth = obj.destination.authentication;
-    if (auth.token) auth.token = maskSecret(auth.token);
-    if (auth.password) auth.password = maskSecret(auth.password);
-    if (auth.apiKey) auth.apiKey = maskSecret(auth.apiKey);
+  if (obj.destinations && Array.isArray(obj.destinations)) {
+    for (const dest of obj.destinations) {
+      if (dest.authentication) {
+        if (dest.authentication.token) dest.authentication.token = maskSecret(dest.authentication.token);
+        if (dest.authentication.password) dest.authentication.password = maskSecret(dest.authentication.password);
+        if (dest.authentication.apiKey) dest.authentication.apiKey = maskSecret(dest.authentication.apiKey);
+        if (dest.authentication.clientSecret) dest.authentication.clientSecret = maskSecret(dest.authentication.clientSecret);
+      }
+    }
+  }
+
+  // Compatibilidade com o campo 'destination' no JSON de resposta
+  if (obj.destinations && obj.destinations.length > 0) {
+    obj.destination = obj.destinations[0];
   }
 
   return obj;

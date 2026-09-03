@@ -15,12 +15,23 @@ export async function createIntegration(data) {
     );
   }
 
-  // 2. Valida URL do destino contra SSRF
-  if (data.destination?.url) {
-    await validateDestinationUrl(data.destination.url);
+  // 2. Normaliza destinos (suporte a destination individual ou destinations array)
+  if (!data.destinations || data.destinations.length === 0) {
+    if (data.destination) {
+      data.destinations = [data.destination];
+    }
   }
 
-  // 3. Cria a integração
+  // 3. Valida URLs de todos os destinos contra SSRF
+  if (data.destinations && Array.isArray(data.destinations)) {
+    for (const dest of data.destinations) {
+      if (dest.url) {
+        await validateDestinationUrl(dest.url);
+      }
+    }
+  }
+
+  // 4. Cria a integração
   const integration = await Integration.create(data);
   return integration;
 }
@@ -105,12 +116,7 @@ export async function updateIntegration(id, updateData) {
     integration.slug = updateData.slug.toLowerCase();
   }
 
-  // Se estiver atualizando a URL de destino, valida SSRF
-  if (updateData.destination?.url) {
-    await validateDestinationUrl(updateData.destination.url);
-  }
-
-  // Atualiza campos permitidos
+  // Atualiza campos gerais
   if (updateData.name) integration.name = updateData.name;
   if (updateData.description !== undefined) integration.description = updateData.description;
   if (typeof updateData.enabled === "boolean") integration.enabled = updateData.enabled;
@@ -129,30 +135,19 @@ export async function updateIntegration(id, updateData) {
     }
   }
 
-  if (updateData.destination) {
-    if (updateData.destination.url) integration.destination.url = updateData.destination.url;
-    if (updateData.destination.method) integration.destination.method = updateData.destination.method;
-    if (updateData.destination.headers) integration.destination.headers = updateData.destination.headers;
-
-    if (updateData.destination.authentication) {
-      const destAuth = updateData.destination.authentication;
-      if (destAuth.type) integration.destination.authentication.type = destAuth.type;
-      if (destAuth.token !== undefined) {
-        integration.destination.authentication.token = destAuth.token ? encrypt(destAuth.token) : null;
-      }
-      if (destAuth.username !== undefined) {
-        integration.destination.authentication.username = destAuth.username;
-      }
-      if (destAuth.password !== undefined) {
-        integration.destination.authentication.password = destAuth.password ? encrypt(destAuth.password) : null;
-      }
-      if (destAuth.apiKey !== undefined) {
-        integration.destination.authentication.apiKey = destAuth.apiKey ? encrypt(destAuth.apiKey) : null;
-      }
-      if (destAuth.apiKeyHeader !== undefined) {
-        integration.destination.authentication.apiKeyHeader = destAuth.apiKeyHeader;
+  // Atualiza destinos
+  if (updateData.destinations && Array.isArray(updateData.destinations)) {
+    for (const dest of updateData.destinations) {
+      if (dest.url) {
+        await validateDestinationUrl(dest.url);
       }
     }
+    integration.destinations = updateData.destinations;
+  } else if (updateData.destination) {
+    if (updateData.destination.url) {
+      await validateDestinationUrl(updateData.destination.url);
+    }
+    integration.destinations = [updateData.destination];
   }
 
   if (updateData.retryPolicy) {
@@ -172,7 +167,6 @@ export async function deleteIntegration(id) {
     throw new AppError("Integração não encontrada.", 404, ERROR_CODES.INTEGRATION_NOT_FOUND);
   }
 
-  // Soft delete para não quebrar histórico de eventos
   integration.isDeleted = true;
   integration.enabled = false;
   await integration.save();

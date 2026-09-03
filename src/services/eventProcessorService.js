@@ -9,7 +9,7 @@ import { EVENT_STATUS, DELIVERY_STATUS, LOG_LEVELS } from "../constants/index.js
 import { logger } from "../utils/logger.js";
 
 /**
- * Orquestra o processamento completo e assíncrono de um evento.
+ * Orquestra o processamento completo e assíncrono de um evento com suporte a Fan-out (múltiplos destinos).
  */
 export async function processEvent(eventId) {
   const event = await Event.findById(eventId);
@@ -19,7 +19,7 @@ export async function processEvent(eventId) {
     throw new Error(`Evento ${eventId} não encontrado`);
   }
 
-  // Se o evento já foi processado com sucesso, não reprocessa
+  // Se o evento já foi processado com sucesso em todos os destinos, ignora
   if (event.status === EVENT_STATUS.SUCCESS) {
     logger.info(`Evento ${eventId} já foi concluído com sucesso. Ignorando.`);
     return event;
@@ -30,23 +30,24 @@ export async function processEvent(eventId) {
     integration = await Integration.findById(event.integrationId);
   }
 
-  // Fallback para integração legada se não houver integrationId
   if (!integration) {
-    // Procura por slug = source
     integration = await Integration.findOne({ slug: event.source, isDeleted: false });
   }
 
-  // Se ainda não tiver integração e existir EXTERNAL_API_URL no ambiente, cria integração fallback temporária
+  // Fallback para integração legada se não houver no banco
   if (!integration) {
     if (process.env.EXTERNAL_API_URL) {
       integration = new Integration({
         name: "Legacy Default Integration",
         slug: event.source || "default",
         enabled: true,
-        destination: {
-          url: process.env.EXTERNAL_API_URL,
-          method: "POST",
-        },
+        destinations: [
+          {
+            name: "primary",
+            url: process.env.EXTERNAL_API_URL,
+            method: "POST",
+          },
+        ],
         retryPolicy: {
           enabled: true,
           maxAttempts: Number(process.env.MAX_RETRY_ATTEMPTS) || 3,
@@ -89,9 +90,14 @@ export async function processEvent(eventId) {
     return event;
   }
 
-  // Atualiza status para processing
   event.status = EVENT_STATUS.PROCESSING;
   await event.save();
+
+  // Lista de destinos (Fan-out)
+  const destinations =
+    integration.destinations && integration.destinations.length > 0
+      ? integration.destinations
+      : [integration.destination];
 
   await createLog({
     eventId: event._id,
@@ -99,156 +105,133 @@ export async function processEvent(eventId) {
     correlationId: event.correlationId,
     level: LOG_LEVELS.INFO,
     step: "processing_started",
-    message: `Iniciando processamento do evento (tentativa ${event.attempts + 1})`,
+    message: `Iniciando processamento fan-out para ${destinations.length} destino(s)`,
     attempt: event.attempts,
+    metadata: { totalDestinations: destinations.length },
   });
 
-  // 1. Aplica mapeamento dinâmico de JSON
-  let transformedData = event.payload;
+  // Mapeamento global ou por destino
+  let globalTransformed = event.payload;
   if (integration.mapping) {
     try {
-      transformedData = transformPayload(event.payload, integration.mapping);
-      event.transformedPayload = transformedData;
+      globalTransformed = transformPayload(event.payload, integration.mapping);
+      event.transformedPayload = globalTransformed;
       await event.save();
+    } catch (mappingErr) {
+      logger.error(`Erro ao transformar payload global: ${mappingErr.message}`);
+    }
+  }
+
+  const maxAttempts = integration.retryPolicy?.maxAttempts || 3;
+  const isRetryEnabled = integration.retryPolicy?.enabled !== false;
+  let minRetryDelay = null;
+
+  // Processa cada destino concorrentemente de forma isolada
+  const deliveryPromises = destinations.map(async (dest, index) => {
+    // Localiza ou cria Delivery para o destino específico
+    let delivery = await Delivery.findOne({
+      eventId: event._id,
+      destinationIndex: index,
+    });
+
+    if (!delivery) {
+      delivery = await Delivery.create({
+        eventId: event._id,
+        integrationId: integration._id,
+        destinationIndex: index,
+        destinationName: dest.name || `dest-${index}`,
+        status: DELIVERY_STATUS.PROCESSING,
+        targetUrl: dest.url,
+        httpMethod: dest.method || "POST",
+        maxAttempts,
+        attemptsCount: 0,
+      });
+    } else {
+      // Se este destino já teve sucesso em tentativa anterior, não precisa reenviar
+      if (delivery.status === DELIVERY_STATUS.SUCCESS) {
+        return { index, status: DELIVERY_STATUS.SUCCESS, skipped: true };
+      }
+      delivery.status = DELIVERY_STATUS.PROCESSING;
+      delivery.lastAttemptAt = new Date();
+      await delivery.save();
+    }
+
+    const currentAttempt = delivery.attemptsCount + 1;
+    delivery.attemptsCount = currentAttempt;
+    delivery.lastAttemptAt = new Date();
+
+    // Aplica mapping específico do destino se configurado, senão usa global
+    let destPayload = globalTransformed;
+    if (dest.mapping) {
+      try {
+        destPayload = transformPayload(event.payload, dest.mapping);
+      } catch (err) {
+        logger.error(`Erro ao transformar mapping do destino ${dest.name}: ${err.message}`);
+      }
+    }
+
+    const result = await executeDelivery({
+      event,
+      integration,
+      destination: dest,
+      destinationIndex: index,
+      payload: destPayload,
+      attemptNumber: currentAttempt,
+      deliveryId: delivery._id,
+    });
+
+    if (result.success) {
+      delivery.status = DELIVERY_STATUS.SUCCESS;
+      delivery.responseStatus = result.statusCode;
+      delivery.responseBody = result.responseData;
+      delivery.lastError = null;
+      await delivery.save();
 
       await createLog({
         eventId: event._id,
         integrationId: integration._id,
+        deliveryId: delivery._id,
         correlationId: event.correlationId,
-        level: LOG_LEVELS.INFO,
-        step: "data_transformed",
-        message: "Payload transformado dinamicamente com sucesso",
-        attempt: event.attempts,
-        metadata: { transformedPayload: transformedData },
+        level: LOG_LEVELS.SUCCESS,
+        step: "delivery_success",
+        message: `Destino [${dest.name || index}] entregue com sucesso (Status: ${result.statusCode}, Latência: ${result.durationMs}ms)`,
+        attempt: currentAttempt,
       });
-    } catch (mappingErr) {
-      logger.error(`Erro ao transformar payload: ${mappingErr.message}`);
+
+      return { index, status: DELIVERY_STATUS.SUCCESS };
     }
-  }
 
-  // 2. Localiza ou cria registro de Delivery
-  let delivery = await Delivery.findOne({ eventId: event._id });
-  if (!delivery) {
-    delivery = await Delivery.create({
-      eventId: event._id,
-      integrationId: integration._id,
-      status: DELIVERY_STATUS.PROCESSING,
-      targetUrl: integration.destination.url,
-      httpMethod: integration.destination.method || "POST",
-      maxAttempts: integration.retryPolicy?.maxAttempts || 3,
-      attemptsCount: 0,
-    });
-  } else {
-    delivery.status = DELIVERY_STATUS.PROCESSING;
-    delivery.lastAttemptAt = new Date();
-    await delivery.save();
-  }
+    // Falha neste destino
+    delivery.lastError = result.error;
+    delivery.responseStatus = result.statusCode;
+    delivery.responseBody = result.responseData;
 
-  const currentAttempt = event.attempts + 1;
-  event.attempts = currentAttempt;
-  delivery.attemptsCount = currentAttempt;
-  delivery.lastAttemptAt = new Date();
+    if (isRetryEnabled && result.isRetryable && currentAttempt < maxAttempts) {
+      const delayMs = result.nextRetryDelayMs || 1000;
+      delivery.status = DELIVERY_STATUS.RETRYING;
+      delivery.nextRetryAt = new Date(Date.now() + delayMs);
+      await delivery.save();
 
-  // 3. Executa entrega HTTP ao destino
-  await createLog({
-    eventId: event._id,
-    integrationId: integration._id,
-    deliveryId: delivery._id,
-    correlationId: event.correlationId,
-    level: LOG_LEVELS.INFO,
-    step: "destination_request_sent",
-    message: `Enviando requisição para ${integration.destination.url} (tentativa ${currentAttempt})`,
-    attempt: currentAttempt,
-  });
+      if (minRetryDelay === null || delayMs < minRetryDelay) {
+        minRetryDelay = delayMs;
+      }
 
-  const deliveryResult = await executeDelivery({
-    event,
-    integration,
-    payload: transformedData,
-    attemptNumber: currentAttempt,
-    deliveryId: delivery._id,
-  });
+      await createLog({
+        eventId: event._id,
+        integrationId: integration._id,
+        deliveryId: delivery._id,
+        correlationId: event.correlationId,
+        level: LOG_LEVELS.WARNING,
+        step: "retry_scheduled",
+        message: `Destino [${dest.name || index}] falhou. Retry agendado em ${delayMs}ms (tentativa ${currentAttempt + 1} de ${maxAttempts}).`,
+        attempt: currentAttempt,
+        metadata: { error: result.error, delayMs },
+      });
 
-  if (deliveryResult.success) {
-    // SUCESSO
-    event.status = EVENT_STATUS.SUCCESS;
-    event.processedAt = new Date();
-    event.lastError = null;
-    await event.save();
+      return { index, status: DELIVERY_STATUS.RETRYING, delayMs };
+    }
 
-    delivery.status = DELIVERY_STATUS.SUCCESS;
-    delivery.responseStatus = deliveryResult.statusCode;
-    delivery.responseBody = deliveryResult.responseData;
-    delivery.lastError = null;
-    await delivery.save();
-
-    await createLog({
-      eventId: event._id,
-      integrationId: integration._id,
-      deliveryId: delivery._id,
-      correlationId: event.correlationId,
-      level: LOG_LEVELS.SUCCESS,
-      step: "delivery_success",
-      message: `Entrega realizada com sucesso (Status: ${deliveryResult.statusCode}, Duração: ${deliveryResult.durationMs}ms)`,
-      attempt: currentAttempt,
-      metadata: {
-        statusCode: deliveryResult.statusCode,
-        response: deliveryResult.responseData,
-      },
-    });
-
-    return event;
-  }
-
-  // FALHA
-  event.lastError = deliveryResult.error;
-  delivery.lastError = deliveryResult.error;
-  delivery.responseStatus = deliveryResult.statusCode;
-  delivery.responseBody = deliveryResult.responseData;
-
-  const maxAttempts = integration.retryPolicy?.maxAttempts || 3;
-  const isRetryEnabled = integration.retryPolicy?.enabled !== false;
-
-  if (isRetryEnabled && deliveryResult.isRetryable && currentAttempt < maxAttempts) {
-    // RETRY AGENDADO
-    const delayMs = deliveryResult.nextRetryDelayMs || 1000;
-    const nextRetryAt = new Date(Date.now() + delayMs);
-
-    event.status = EVENT_STATUS.RETRYING;
-    await event.save();
-
-    delivery.status = DELIVERY_STATUS.RETRYING;
-    delivery.nextRetryAt = nextRetryAt;
-    await delivery.save();
-
-    await createLog({
-      eventId: event._id,
-      integrationId: integration._id,
-      deliveryId: delivery._id,
-      correlationId: event.correlationId,
-      level: LOG_LEVELS.WARNING,
-      step: "retry_scheduled",
-      message: `Tentativa ${currentAttempt} falhou. Próximo retry em ${delayMs}ms (tentativa ${currentAttempt + 1} de ${maxAttempts}).`,
-      attempt: currentAttempt,
-      metadata: {
-        error: deliveryResult.error,
-        statusCode: deliveryResult.statusCode,
-        delayMs,
-        nextRetryAt,
-      },
-    });
-
-    // Enfileira próximo job com delay
-    await addEventJob({
-      eventId: event._id,
-      attempt: currentAttempt + 1,
-      delayMs,
-    });
-  } else {
-    // DEAD LETTER / FAILED
-    event.status = EVENT_STATUS.DEAD_LETTER;
-    await event.save();
-
+    // Dead letter para este destino
     delivery.status = DELIVERY_STATUS.DEAD_LETTER;
     await delivery.save();
 
@@ -259,16 +242,43 @@ export async function processEvent(eventId) {
       correlationId: event.correlationId,
       level: LOG_LEVELS.ERROR,
       step: "dead_letter_reached",
-      message: `Processamento do evento finalizado como Dead Letter após ${currentAttempt} tentativas. Erro: ${deliveryResult.error}`,
+      message: `Destino [${dest.name || index}] finalizado em Dead Letter após ${currentAttempt} tentativas.`,
       attempt: currentAttempt,
-      metadata: {
-        error: deliveryResult.error,
-        statusCode: deliveryResult.statusCode,
-        maxAttempts,
-        isRetryable: deliveryResult.isRetryable,
-      },
+      metadata: { error: result.error },
     });
+
+    return { index, status: DELIVERY_STATUS.DEAD_LETTER, error: result.error };
+  });
+
+  const results = await Promise.all(deliveryPromises);
+
+  // Calcula o status consolidado do Evento
+  const allDeliveries = await Delivery.find({ eventId: event._id });
+  const hasRetrying = allDeliveries.some((d) => d.status === DELIVERY_STATUS.RETRYING);
+  const hasDeadLetter = allDeliveries.some((d) => d.status === DELIVERY_STATUS.DEAD_LETTER);
+  const allSuccess = allDeliveries.length > 0 && allDeliveries.every((d) => d.status === DELIVERY_STATUS.SUCCESS);
+
+  event.attempts += 1;
+
+  if (allSuccess) {
+    event.status = EVENT_STATUS.SUCCESS;
+    event.processedAt = new Date();
+    event.lastError = null;
+  } else if (hasRetrying) {
+    event.status = EVENT_STATUS.RETRYING;
+    // Enfileira novo ciclo para os destinos pendentes
+    if (minRetryDelay !== null) {
+      await addEventJob({
+        eventId: event._id,
+        attempt: event.attempts + 1,
+        delayMs: minRetryDelay,
+      });
+    }
+  } else if (hasDeadLetter) {
+    event.status = EVENT_STATUS.DEAD_LETTER;
+    event.lastError = results.find((r) => r.error)?.error || "Um ou mais destinos falharam.";
   }
 
+  await event.save();
   return event;
 }

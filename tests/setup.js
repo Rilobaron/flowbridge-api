@@ -48,6 +48,11 @@ function matchFilter(doc, filter = {}) {
       continue;
     }
 
+    if (key === "destinationIndex" && typeof value === "number") {
+      if (Number(doc.destinationIndex) !== Number(value)) return false;
+      continue;
+    }
+
     if (value && typeof value === "object" && value.$regex) {
       const regex = new RegExp(value.$regex, value.$options || "");
       if (!regex.test(doc[key] || "")) return false;

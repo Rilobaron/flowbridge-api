@@ -1,6 +1,7 @@
 import axios from "axios";
 import DeliveryAttempt from "../models/DeliveryAttempt.js";
 import { validateDestinationUrl } from "./ssrfProtectionService.js";
+import { getOAuthAccessToken } from "./oauthService.js";
 import {
   OUTBOUND_AUTH_TYPE,
   RETRYABLE_HTTP_STATUSES,
@@ -18,11 +19,9 @@ export function isRetryableError(error, responseStatus) {
     if (NON_RETRYABLE_HTTP_STATUSES.includes(responseStatus)) {
       return false;
     }
-    // 5xx por padrão são retryable
     return responseStatus >= 500;
   }
 
-  // Erros de timeout ou de rede sem resposta do servidor
   const retryableNetworkCodes = [
     "ECONNRESET",
     "ETIMEDOUT",
@@ -51,11 +50,9 @@ export function calculateBackoffDelay(attemptNumber, retryPolicy = {}) {
   const multiplier = retryPolicy.multiplier || 2;
   const maxDelay = retryPolicy.maxDelay || 60000;
 
-  // exponential backoff: initialDelay * multiplier^(attempt-1)
   const baseDelay = initialDelay * Math.pow(multiplier, Math.max(0, attemptNumber - 1));
   const cappedDelay = Math.min(baseDelay, maxDelay);
 
-  // Adiciona jitter leve (+-10%) para evitar thundering herd
   const jitter = cappedDelay * 0.1 * (Math.random() * 2 - 1);
   return Math.max(500, Math.round(cappedDelay + jitter));
 }
@@ -81,19 +78,30 @@ function sanitizeHeaders(headers = {}) {
 export async function executeDelivery({
   event,
   integration,
+  destination = null,
+  destinationIndex = 0,
   payload,
   attemptNumber = 1,
   deliveryId,
 }) {
-  const targetUrl = integration.destination.url;
-  const method = (integration.destination.method || "POST").toUpperCase();
-  const timeout = integration.timeout || 5000;
+  // Se destino não for passado explicitamente, resolve a partir da integração
+  const targetDest =
+    destination ||
+    (integration.destinations && integration.destinations[destinationIndex]
+      ? integration.destinations[destinationIndex]
+      : integration.destination);
+
+  const targetUrl = targetDest.url;
+  const method = (targetDest.method || "POST").toUpperCase();
+  const timeout = targetDest.timeout || integration.timeout || 5000;
 
   // Validação SSRF
   await validateDestinationUrl(targetUrl);
 
-  // Recupera credenciais descriptografadas
-  const credentials = integration.getDecryptedCredentials();
+  // Recupera credenciais descriptografadas do destino
+  const credentials = integration.getDecryptedCredentials
+    ? integration.getDecryptedCredentials(destinationIndex)
+    : {};
 
   // Constrói headers
   const headers = {
@@ -104,29 +112,44 @@ export async function executeDelivery({
     "X-Attempt-Number": String(attemptNumber),
   };
 
-  // Aplica headers customizados da integração
-  if (integration.destination.headers) {
+  // Aplica headers customizados do destino
+  if (targetDest.headers) {
     const customHeaders =
-      integration.destination.headers instanceof Map
-        ? Object.fromEntries(integration.destination.headers)
-        : integration.destination.headers;
+      targetDest.headers instanceof Map
+        ? Object.fromEntries(targetDest.headers)
+        : targetDest.headers;
 
     Object.assign(headers, customHeaders);
   }
 
   // Aplica autenticação outbound
-  const authType = integration.destination.authentication?.type || OUTBOUND_AUTH_TYPE.NONE;
+  const authConfig = targetDest.authentication || {};
+  const authType = authConfig.type || OUTBOUND_AUTH_TYPE.NONE;
 
   if (authType === OUTBOUND_AUTH_TYPE.BEARER && credentials.destinationToken) {
     headers["Authorization"] = `Bearer ${credentials.destinationToken}`;
   } else if (authType === OUTBOUND_AUTH_TYPE.API_KEY && credentials.destinationApiKey) {
-    const headerName = integration.destination.authentication.apiKeyHeader || "X-API-Key";
+    const headerName = authConfig.apiKeyHeader || "X-API-Key";
     headers[headerName] = credentials.destinationApiKey;
   } else if (authType === OUTBOUND_AUTH_TYPE.BASIC) {
     const username = credentials.destinationUsername || "";
     const password = credentials.destinationPassword || "";
     const token = Buffer.from(`${username}:${password}`).toString("base64");
     headers["Authorization"] = `Basic ${token}`;
+  } else if (authType === OUTBOUND_AUTH_TYPE.OAUTH2) {
+    const tokenUrl = authConfig.tokenUrl;
+    const clientId = credentials.destinationClientId || authConfig.clientId;
+    const clientSecret = credentials.destinationClientSecret;
+
+    const accessToken = await getOAuthAccessToken({
+      tokenUrl,
+      clientId,
+      clientSecret,
+      scope: authConfig.scope,
+      timeout,
+    });
+
+    headers["Authorization"] = `Bearer ${accessToken}`;
   }
 
   const startTime = Date.now();
@@ -144,7 +167,7 @@ export async function executeDelivery({
       params: method === "GET" ? payload : undefined,
       headers,
       timeout,
-      validateStatus: (status) => status >= 200 && status < 300, // Apenas 2xx é sucesso
+      validateStatus: (status) => status >= 200 && status < 300,
     });
 
     const durationMs = Date.now() - startTime;
@@ -152,7 +175,6 @@ export async function executeDelivery({
     responseHeaders = response.headers;
     responseBody = response.data;
 
-    // Registra tentativa com sucesso
     await DeliveryAttempt.create({
       deliveryId,
       eventId: event._id,
@@ -198,7 +220,6 @@ export async function executeDelivery({
     const retryable = isRetryableError(error, responseStatus);
     const retryDelay = calculateBackoffDelay(attemptNumber, integration.retryPolicy);
 
-    // Registra tentativa com falha
     await DeliveryAttempt.create({
       deliveryId,
       eventId: event._id,

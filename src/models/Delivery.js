@@ -17,6 +17,17 @@ const deliverySchema = new mongoose.Schema(
       index: true,
     },
 
+    destinationIndex: {
+      type: Number,
+      default: 0,
+    },
+
+    destinationName: {
+      type: String,
+      default: "primary",
+      trim: true,
+    },
+
     status: {
       type: String,
       enum: Object.values(DELIVERY_STATUS),
@@ -75,6 +86,7 @@ const deliverySchema = new mongoose.Schema(
   }
 );
 
+deliverySchema.index({ eventId: 1, destinationIndex: 1 }, { unique: true });
 deliverySchema.index({ eventId: 1, status: 1 });
 deliverySchema.index({ integrationId: 1, createdAt: -1 });
 

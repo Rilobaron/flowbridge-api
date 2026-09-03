@@ -10,6 +10,7 @@ import integrationRoutes from "./routes/integrationRoutes.js";
 import webhookRoutes from "./routes/webhookRoutes.js";
 import eventRoutes from "./routes/eventRoutes.js";
 import logRoutes from "./routes/logRoutes.js";
+import metricsRoutes from "./routes/metricsRoutes.js";
 import mockExternalApiRoutes from "./routes/mockExternalApiRoutes.js";
 import testRoutes from "./routes/testRoutes.js";
 
@@ -35,9 +36,10 @@ app.use(
 );
 app.use(express.urlencoded({ extended: true, limit: maxBodySize }));
 
-// 4. Health e Readiness Check
+// 4. Health, Readiness e Métricas Prometheus
 app.get("/health", healthCheck);
 app.get("/ready", readinessCheck);
+app.use(metricsRoutes);
 
 // 5. Documentação Swagger OpenAPI 3.0
 setupSwagger(app);

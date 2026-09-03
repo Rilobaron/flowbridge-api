@@ -4,9 +4,9 @@ export const swaggerDocument = {
   openapi: "3.0.0",
   info: {
     title: "FlowBridge API",
-    version: "1.0.0",
+    version: "1.1.0",
     description:
-      "API intermediária de integração genérica para recepção de webhooks, mapeamento dinâmico de dados, enfileiramento assíncrono, execução resiliente com retry, backoff exponencial e Dead Letter Queue.",
+      "API intermediária de integração genérica para recepção de webhooks, mapeamento dinâmico de dados, enfileiramento assíncrono, Fan-out para múltiplos destinos, autenticação OAuth2 e Dead Letter Queue.",
   },
   servers: [
     {
@@ -49,13 +49,40 @@ export const swaggerDocument = {
           },
         },
       },
+      DestinationItem: {
+        type: "object",
+        properties: {
+          name: { type: "string", example: "CRM" },
+          url: { type: "string", example: "https://api.crm-exemplo.com/v1/leads" },
+          method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"], example: "POST" },
+          headers: { type: "object", example: { "X-App": "FlowBridge" } },
+          mapping: {
+            type: "object",
+            example: {
+              lead_name: "customer.full_name",
+              lead_email: "customer.email",
+            },
+          },
+          authentication: {
+            type: "object",
+            properties: {
+              type: { type: "string", enum: ["none", "bearer", "apiKey", "basic", "oauth2"], example: "oauth2" },
+              token: { type: "string", example: "********" },
+              tokenUrl: { type: "string", example: "https://auth.crm-exemplo.com/oauth/token" },
+              clientId: { type: "string", example: "client_id_123" },
+              clientSecret: { type: "string", example: "********" },
+              scope: { type: "string", example: "leads:write" },
+            },
+          },
+        },
+      },
       Integration: {
         type: "object",
         properties: {
           id: { type: "string", example: "64f1a2b3c4d5e6f7a8b9c0d1" },
-          name: { type: "string", example: "Meta Leads para CRM" },
+          name: { type: "string", example: "Meta Leads para CRM & Data Lake" },
           slug: { type: "string", example: "meta-leads" },
-          description: { type: "string", example: "Encaminha leads do Facebook Ads para a API de CRM" },
+          description: { type: "string", example: "Encaminha leads para múltiplos destinos simultaneamente" },
           enabled: { type: "boolean", example: true },
           source: {
             type: "object",
@@ -64,28 +91,16 @@ export const swaggerDocument = {
               secret: { type: "string", example: "********" },
             },
           },
-          destination: {
-            type: "object",
-            properties: {
-              url: { type: "string", example: "https://api.crm-exemplo.com/v1/leads" },
-              method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"], example: "POST" },
-              headers: { type: "object", example: { "X-App": "FlowBridge" } },
-              authentication: {
-                type: "object",
-                properties: {
-                  type: { type: "string", enum: ["none", "bearer", "apiKey", "basic"], example: "bearer" },
-                  token: { type: "string", example: "********" },
-                },
-              },
-            },
+          destinations: {
+            type: "array",
+            items: { $ref: "#/components/schemas/DestinationItem" },
           },
           mapping: {
             type: "object",
             example: {
               name: "customer.full_name",
               email: "customer.email",
-              phone: "customer.phone",
-              source_tag: "_fixed:meta_ads",
+              origin: "_fixed:meta_ads",
             },
           },
           retryPolicy: {
@@ -118,6 +133,14 @@ export const swaggerDocument = {
         responses: {
           200: { description: "Serviços prontos para receber tráfego" },
           503: { description: "Serviço indisponível" },
+        },
+      },
+    },
+    "/metrics": {
+      get: {
+        summary: "Métricas no formato padrão do Prometheus",
+        responses: {
+          200: { description: "Métricas para scraping do Prometheus" },
         },
       },
     },
@@ -193,29 +216,12 @@ export const swaggerDocument = {
           content: {
             "application/json": {
               schema: { type: "object" },
-              example: {
-                customer: {
-                  full_name: "João Silva",
-                  email: "joao@email.com",
-                  phone: "11999999999",
-                },
-              },
             },
           },
         },
         responses: {
           202: {
-            description: "Webhook recebido e enfileirado para processamento assíncrono",
-            content: {
-              "application/json": {
-                example: {
-                  success: true,
-                  message: "Webhook recebido e enfileirado para processamento.",
-                  eventId: "64f1a2b3c4d5e6f7a8b9c0d1",
-                  status: "queued",
-                },
-              },
-            },
+            description: "Webhook recebido e enfileirado para processamento assíncrono (Fan-out)",
           },
           200: { description: "Evento idempotente já recebido anteriormente" },
           401: { description: "Falha de autenticação do webhook" },
@@ -250,7 +256,7 @@ export const swaggerDocument = {
     },
     "/api/v1/events/{id}": {
       get: {
-        summary: "Consultar detalhes completos de um evento (inclui entregas e tentativas HTTP)",
+        summary: "Consultar detalhes completos de um evento (inclui todas as entregas fan-out e tentativas HTTP)",
         security: [{ AdminApiKey: [] }],
         parameters: [{ name: "id", in: "path", required: true, schema: { type: "string" } }],
         responses: {
