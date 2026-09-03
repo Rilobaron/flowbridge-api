@@ -6,7 +6,13 @@
   "type": "module",
   "scripts": {
     "dev": "nodemon src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "test": "vitest run --isolate=false",
+    "test:watch": "vitest --isolate=false",
+    "test:coverage": "vitest run --isolate=false --coverage",
+    "lint": "eslint src tests",
+    "lint:fix": "eslint src tests --fix",
+    "format": "prettier --write \"src/**/*.{js,json}\" \"tests/**/*.{js,json}\""
   },
   "keywords": [
     "nodejs",
@@ -16,17 +22,34 @@
     "webhook",
     "api",
     "automation",
-    "integration"
+    "integration",
+    "bullmq",
+    "retry",
+    "dead-letter"
   ],
   "author": "Murilo Baron",
   "license": "MIT",
   "dependencies": {
     "axios": "^1.0.0",
+    "bullmq": "^5.66.0",
+    "cors": "^2.8.5",
     "dotenv": "^17.0.0",
     "express": "^5.0.0",
-    "mongoose": "^9.0.0"
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
+    "ioredis": "^5.6.1",
+    "ipaddr.js": "^2.2.0",
+    "mongoose": "^9.0.0",
+    "swagger-ui-express": "^5.0.1",
+    "winston": "^3.19.0",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
-    "nodemon": "^3.0.0"
+    "eslint": "^9.39.2",
+    "mongodb-memory-server": "^11.2.0",
+    "nodemon": "^3.0.0",
+    "prettier": "^3.8.1",
+    "supertest": "^7.2.1",
+    "vitest": "^4.0.18"
   }
 }

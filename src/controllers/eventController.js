@@ -1,10 +1,13 @@
 import Event from "../models/Event.js";
-import { processEvent } from "../services/eventProcessorService.js";
+import Delivery from "../models/Delivery.js";
+import DeliveryAttempt from "../models/DeliveryAttempt.js";
+import { addEventJob } from "../queues/eventQueue.js";
 import { createLog } from "../services/logService.js";
 import { AppError } from "../utils/AppError.js";
+import { EVENT_STATUS, LOG_LEVELS, ERROR_CODES } from "../constants/index.js";
 
 export async function listEvents(req, res) {
-  const { status, source, eventType, page = 1, limit = 10 } = req.query;
+  const { status, source, eventType, integrationId, page = 1, limit = 10 } = req.query;
 
   const filters = {};
 
@@ -20,8 +23,12 @@ export async function listEvents(req, res) {
     filters.eventType = eventType;
   }
 
-  const pageNumber = Number(page);
-  const limitNumber = Number(limit);
+  if (integrationId) {
+    filters.integrationId = integrationId;
+  }
+
+  const pageNumber = Math.max(1, Number(page) || 1);
+  const limitNumber = Math.min(100, Math.max(1, Number(limit) || 10)); // Limite máx 100
   const skip = (pageNumber - 1) * limitNumber;
 
   const [events, total] = await Promise.all([
@@ -31,13 +38,14 @@ export async function listEvents(req, res) {
 
   return res.status(200).json({
     success: true,
-    count: events.length,
-    total,
-    page: pageNumber,
-    limit: limitNumber,
-    totalPages: Math.ceil(total / limitNumber),
-    filters,
     data: events,
+    pagination: {
+      total,
+      page: pageNumber,
+      limit: limitNumber,
+      totalPages: Math.ceil(total / limitNumber),
+    },
+    filters,
   });
 }
 
@@ -89,7 +97,10 @@ export async function getEventStats(req, res) {
 
   const successCount = statusSummary.success || 0;
   const failedCount = statusSummary.failed || 0;
+  const deadLetterCount = statusSummary.dead_letter || 0;
+  const retryingCount = statusSummary.retrying || 0;
   const processingCount = statusSummary.processing || 0;
+  const queuedCount = statusSummary.queued || 0;
   const receivedCount = statusSummary.received || 0;
 
   const successRate =
@@ -102,9 +113,12 @@ export async function getEventStats(req, res) {
       successRate,
       status: {
         received: receivedCount,
+        queued: queuedCount,
         processing: processingCount,
+        retrying: retryingCount,
         success: successCount,
         failed: failedCount,
+        dead_letter: deadLetterCount,
       },
       sources: bySource.map((item) => ({
         source: item._id,
@@ -119,61 +133,82 @@ export async function getEventStats(req, res) {
 }
 
 export async function getEventById(req, res) {
-  const { eventId } = req.params;
+  const { eventId, id } = req.params;
+  const targetId = eventId || id;
 
-  const event = await Event.findById(eventId);
+  const event = await Event.findById(targetId).populate("integrationId", "name slug destination enabled");
 
   if (!event) {
-    throw new AppError("Event not found", 404);
+    throw new AppError("Evento não encontrado.", 404, ERROR_CODES.EVENT_NOT_FOUND);
   }
+
+  // Busca deliveries e tentativas associadas
+  const deliveries = await Delivery.find({ eventId: event._id });
+  const attempts = await DeliveryAttempt.find({ eventId: event._id }).sort({ createdAt: -1 });
 
   return res.status(200).json({
     success: true,
-    data: event,
+    data: {
+      ...event.toObject(),
+      deliveries,
+      deliveryAttempts: attempts,
+    },
   });
 }
 
 export async function retryEvent(req, res) {
-  const { eventId } = req.params;
+  const { eventId, id } = req.params;
+  const targetId = eventId || id;
   const { simulateFailure } = req.body || {};
 
-  const event = await Event.findById(eventId);
+  const event = await Event.findById(targetId);
 
   if (!event) {
-    throw new AppError("Event not found", 404);
+    throw new AppError("Evento não encontrado.", 404, ERROR_CODES.EVENT_NOT_FOUND);
   }
 
-  if (event.status === "processing") {
-    throw new AppError("Event is already processing", 409);
+  if (event.status === EVENT_STATUS.PROCESSING) {
+    throw new AppError(
+      "O evento já está sendo processado no momento.",
+      409,
+      ERROR_CODES.VALIDATION_ERROR
+    );
   }
 
-  if (typeof simulateFailure === "boolean") {
+  if (typeof simulateFailure === "boolean" && event.payload) {
     event.payload = {
       ...event.payload,
       simulateFailure,
     };
-
-    await event.save();
   }
+
+  // Reseta status para queued e zera attempts para novo ciclo manual
+  const previousStatus = event.status;
+  event.status = EVENT_STATUS.QUEUED;
+  await event.save();
 
   await createLog({
     eventId: event._id,
-    level: "info",
+    integrationId: event.integrationId,
+    correlationId: event.correlationId,
+    level: LOG_LEVELS.INFO,
     step: "manual_retry_requested",
-    message: "Manual retry requested",
-    attempt: event.attempts,
+    message: "Reprocessamento manual do evento solicitado",
     metadata: {
-      previousStatus: event.status,
-      simulateFailure:
-        typeof simulateFailure === "boolean" ? simulateFailure : undefined,
+      previousStatus,
+      simulateFailure: typeof simulateFailure === "boolean" ? simulateFailure : undefined,
     },
   });
 
-  const processedEvent = await processEvent(event._id);
+  // Enfileira de forma assíncrona
+  await addEventJob({ eventId: event._id });
 
   return res.status(200).json({
     success: true,
-    message: "Event retried successfully",
-    data: processedEvent,
+    message: "Evento reenfileirado para reprocessamento manual.",
+    data: {
+      eventId: event._id,
+      status: EVENT_STATUS.QUEUED,
+    },
   });
 }

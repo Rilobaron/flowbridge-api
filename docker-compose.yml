@@ -1,0 +1,71 @@
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: flowbridge_api
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=development
+      - PORT=3000
+      - MONGODB_URI=mongodb://mongodb:27017/flowbridge
+      - REDIS_URL=redis://redis:6379
+      - ADMIN_API_KEY=flowbridge_admin_secret_key_2026
+      - ENCRYPTION_KEY=flowbridge_encryption_master_key_2026
+      - ALLOW_LOCAL_DESTINATIONS=true
+      - LOG_LEVEL=info
+      - EVENT_RETENTION_DAYS=30
+      - LOG_RETENTION_DAYS=15
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - flowbridge_net
+
+  mongodb:
+    image: mongo:7
+    container_name: flowbridge_mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh localhost:27017/test --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - flowbridge_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: flowbridge_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - flowbridge_net
+
+volumes:
+  mongodb_data:
+  redis_data:
+
+networks:
+  flowbridge_net:
+    driver: bridge

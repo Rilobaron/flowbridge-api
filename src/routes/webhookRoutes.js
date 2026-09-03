@@ -1,9 +1,21 @@
 import { Router } from "express";
-import { receiveWebhook } from "../controllers/webhookController.js";
+import {
+  receiveDynamicWebhook,
+  receiveLegacyWebhook,
+} from "../controllers/webhookController.js";
+import { webhookAuthMiddleware } from "../middlewares/webhookAuthMiddleware.js";
 import { asyncHandler } from "../utils/asyncHandler.js";
 
 const router = Router();
 
-router.post("/webhook", asyncHandler(receiveWebhook));
+// Webhook dinâmico baseado na Integration
+router.post(
+  "/webhooks/:slug",
+  asyncHandler(webhookAuthMiddleware),
+  asyncHandler(receiveDynamicWebhook)
+);
+
+// Rota legada para retrocompatibilidade
+router.post("/webhook", asyncHandler(receiveLegacyWebhook));
 
 export default router;
