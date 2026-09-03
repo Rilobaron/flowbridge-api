@@ -33,7 +33,6 @@ const destinationAuthSchema = new mongoose.Schema(
       type: String,
       default: "X-API-Key",
     },
-    // Suporte a OAuth2
     tokenUrl: {
       type: String,
       default: null,
@@ -77,6 +76,11 @@ export const destinationSchema = new mongoose.Schema(
       default: {},
     },
     mapping: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    // Filtro condicional específico para este destino
+    filter: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
     },
@@ -127,6 +131,13 @@ const integrationSchema = new mongoose.Schema(
       index: true,
     },
 
+    // URL opcional para notificação de alertas (Slack, Discord, PagerDuty) em Dead Letter
+    alertWebhookUrl: {
+      type: String,
+      trim: true,
+      default: null,
+    },
+
     source: {
       authenticationType: {
         type: String,
@@ -143,13 +154,17 @@ const integrationSchema = new mongoose.Schema(
       },
     },
 
-    // Suporte a múltiplos destinos (Fan-out)
     destinations: {
       type: [destinationSchema],
       default: [],
     },
 
-    // Mapeamento global padrão (usado se o destino não tiver mapping específico)
+    // Filtro condicional global da integração
+    filter: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+
     mapping: {
       type: mongoose.Schema.Types.Mixed,
       default: null,
@@ -210,12 +225,10 @@ integrationSchema.virtual("destination").get(function () {
 
 // Hook para criptografar secrets antes de salvar
 integrationSchema.pre("save", function () {
-  // 1. Inbound secret
   if (this.isModified("source.secret") && this.source?.secret) {
     this.source.secret = encrypt(this.source.secret);
   }
 
-  // 2. Outbound secrets em cada destino
   if (this.destinations && Array.isArray(this.destinations)) {
     for (const dest of this.destinations) {
       if (dest.authentication) {
@@ -271,7 +284,6 @@ integrationSchema.methods.toJSON = function () {
     }
   }
 
-  // Compatibilidade com o campo 'destination' no JSON de resposta
   if (obj.destinations && obj.destinations.length > 0) {
     obj.destination = obj.destinations[0];
   }

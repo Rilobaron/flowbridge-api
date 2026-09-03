@@ -4,9 +4,9 @@ export const swaggerDocument = {
   openapi: "3.0.0",
   info: {
     title: "FlowBridge API",
-    version: "1.1.0",
+    version: "1.2.0",
     description:
-      "API intermediária de integração genérica para recepção de webhooks, mapeamento dinâmico de dados, enfileiramento assíncrono, Fan-out para múltiplos destinos, autenticação OAuth2 e Dead Letter Queue.",
+      "API intermediária de integração genérica para recepção de webhooks, filtros condicionais de eventos, mapeamento dinâmico de dados, enfileiramento assíncrono, Fan-out para múltiplos destinos, autenticação OAuth2, Dead Letter Queue e alertas automáticos.",
   },
   servers: [
     {
@@ -56,6 +56,10 @@ export const swaggerDocument = {
           url: { type: "string", example: "https://api.crm-exemplo.com/v1/leads" },
           method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"], example: "POST" },
           headers: { type: "object", example: { "X-App": "FlowBridge" } },
+          filter: {
+            type: "object",
+            example: { "customer.plan": "enterprise" },
+          },
           mapping: {
             type: "object",
             example: {
@@ -84,6 +88,7 @@ export const swaggerDocument = {
           slug: { type: "string", example: "meta-leads" },
           description: { type: "string", example: "Encaminha leads para múltiplos destinos simultaneamente" },
           enabled: { type: "boolean", example: true },
+          alertWebhookUrl: { type: "string", example: "https://hooks.slack.com/services/T00/B00/XXXX" },
           source: {
             type: "object",
             properties: {
@@ -94,6 +99,10 @@ export const swaggerDocument = {
           destinations: {
             type: "array",
             items: { $ref: "#/components/schemas/DestinationItem" },
+          },
+          filter: {
+            type: "object",
+            example: { "customer.country": "BR" },
           },
           mapping: {
             type: "object",
@@ -146,7 +155,7 @@ export const swaggerDocument = {
     },
     "/api/v1/integrations": {
       post: {
-        summary: "Criar uma nova integração",
+        summary: "Criar uma nova integração (suporta múltiplos destinos, regras de filtro e alertas)",
         security: [{ AdminApiKey: [] }],
         requestBody: {
           required: true,
@@ -234,7 +243,7 @@ export const swaggerDocument = {
         summary: "Listar eventos processados",
         security: [{ AdminApiKey: [] }],
         parameters: [
-          { name: "status", in: "query", schema: { type: "string", enum: ["received", "queued", "processing", "retrying", "success", "failed", "dead_letter"] } },
+          { name: "status", in: "query", schema: { type: "string", enum: ["received", "queued", "processing", "retrying", "success", "skipped", "failed", "dead_letter"] } },
           { name: "source", in: "query", schema: { type: "string" } },
           { name: "eventType", in: "query", schema: { type: "string" } },
           { name: "page", in: "query", schema: { type: "integer", default: 1 } },

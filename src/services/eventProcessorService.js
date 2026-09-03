@@ -2,14 +2,16 @@ import Event from "../models/Event.js";
 import Integration from "../models/Integration.js";
 import Delivery from "../models/Delivery.js";
 import { transformPayload } from "./mappingService.js";
+import { matchesFilter } from "./filterService.js";
 import { executeDelivery } from "./deliveryService.js";
+import { sendDeadLetterAlert } from "./alertService.js";
 import { createLog } from "./logService.js";
 import { addEventJob } from "../queues/eventQueue.js";
 import { EVENT_STATUS, DELIVERY_STATUS, LOG_LEVELS } from "../constants/index.js";
 import { logger } from "../utils/logger.js";
 
 /**
- * Orquestra o processamento completo e assíncrono de um evento com suporte a Fan-out (múltiplos destinos).
+ * Orquestra o processamento completo e assíncrono de um evento com suporte a Fan-out, Filtros e Alertas.
  */
 export async function processEvent(eventId) {
   const event = await Event.findById(eventId);
@@ -19,9 +21,9 @@ export async function processEvent(eventId) {
     throw new Error(`Evento ${eventId} não encontrado`);
   }
 
-  // Se o evento já foi processado com sucesso em todos os destinos, ignora
-  if (event.status === EVENT_STATUS.SUCCESS) {
-    logger.info(`Evento ${eventId} já foi concluído com sucesso. Ignorando.`);
+  // Se o evento já foi processado com sucesso ou pulado por filtro, ignora
+  if (event.status === EVENT_STATUS.SUCCESS || event.status === EVENT_STATUS.SKIPPED) {
+    logger.info(`Evento ${eventId} já foi finalizado (${event.status}). Ignorando.`);
     return event;
   }
 
@@ -110,7 +112,7 @@ export async function processEvent(eventId) {
     metadata: { totalDestinations: destinations.length },
   });
 
-  // Mapeamento global ou por destino
+  // Mapeamento global se configurado
   let globalTransformed = event.payload;
   if (integration.mapping) {
     try {
@@ -128,7 +130,6 @@ export async function processEvent(eventId) {
 
   // Processa cada destino concorrentemente de forma isolada
   const deliveryPromises = destinations.map(async (dest, index) => {
-    // Localiza ou cria Delivery para o destino específico
     let delivery = await Delivery.findOne({
       eventId: event._id,
       destinationIndex: index,
@@ -147,20 +148,42 @@ export async function processEvent(eventId) {
         attemptsCount: 0,
       });
     } else {
-      // Se este destino já teve sucesso em tentativa anterior, não precisa reenviar
-      if (delivery.status === DELIVERY_STATUS.SUCCESS) {
-        return { index, status: DELIVERY_STATUS.SUCCESS, skipped: true };
+      if (delivery.status === DELIVERY_STATUS.SUCCESS || delivery.status === DELIVERY_STATUS.SKIPPED) {
+        return { index, status: delivery.status, skipped: true };
       }
       delivery.status = DELIVERY_STATUS.PROCESSING;
       delivery.lastAttemptAt = new Date();
       await delivery.save();
     }
 
+    // 1. Avalia Filtro Condicional Global ou do Destino
+    const filterToApply = dest.filter || integration.filter;
+    if (filterToApply) {
+      const filterResult = matchesFilter(event.payload, filterToApply);
+      if (!filterResult.matches) {
+        delivery.status = DELIVERY_STATUS.SKIPPED;
+        delivery.lastError = filterResult.reason;
+        await delivery.save();
+
+        await createLog({
+          eventId: event._id,
+          integrationId: integration._id,
+          deliveryId: delivery._id,
+          correlationId: event.correlationId,
+          level: LOG_LEVELS.INFO,
+          step: "delivery_skipped",
+          message: `Destino [${dest.name || index}] pulado por regra de filtro: ${filterResult.reason}`,
+        });
+
+        return { index, status: DELIVERY_STATUS.SKIPPED, skipped: true };
+      }
+    }
+
     const currentAttempt = delivery.attemptsCount + 1;
     delivery.attemptsCount = currentAttempt;
     delivery.lastAttemptAt = new Date();
 
-    // Aplica mapping específico do destino se configurado, senão usa global
+    // Aplica mapping específico do destino se configurado
     let destPayload = globalTransformed;
     if (dest.mapping) {
       try {
@@ -252,21 +275,26 @@ export async function processEvent(eventId) {
 
   const results = await Promise.all(deliveryPromises);
 
-  // Calcula o status consolidado do Evento
+  // Consolidação do status do Evento
   const allDeliveries = await Delivery.find({ eventId: event._id });
   const hasRetrying = allDeliveries.some((d) => d.status === DELIVERY_STATUS.RETRYING);
   const hasDeadLetter = allDeliveries.some((d) => d.status === DELIVERY_STATUS.DEAD_LETTER);
-  const allSuccess = allDeliveries.length > 0 && allDeliveries.every((d) => d.status === DELIVERY_STATUS.SUCCESS);
+  const allSkipped = allDeliveries.length > 0 && allDeliveries.every((d) => d.status === DELIVERY_STATUS.SKIPPED);
+  const allResolved =
+    allDeliveries.length > 0 &&
+    allDeliveries.every((d) => d.status === DELIVERY_STATUS.SUCCESS || d.status === DELIVERY_STATUS.SKIPPED);
 
   event.attempts += 1;
 
-  if (allSuccess) {
+  if (allSkipped) {
+    event.status = EVENT_STATUS.SKIPPED;
+    event.processedAt = new Date();
+  } else if (allResolved) {
     event.status = EVENT_STATUS.SUCCESS;
     event.processedAt = new Date();
     event.lastError = null;
   } else if (hasRetrying) {
     event.status = EVENT_STATUS.RETRYING;
-    // Enfileira novo ciclo para os destinos pendentes
     if (minRetryDelay !== null) {
       await addEventJob({
         eventId: event._id,
@@ -277,6 +305,16 @@ export async function processEvent(eventId) {
   } else if (hasDeadLetter) {
     event.status = EVENT_STATUS.DEAD_LETTER;
     event.lastError = results.find((r) => r.error)?.error || "Um ou mais destinos falharam.";
+
+    // Dispara alerta automático de Dead Letter
+    sendDeadLetterAlert({
+      event,
+      integration,
+      lastError: event.lastError,
+      attempts: event.attempts,
+    }).catch((alertErr) => {
+      logger.warn(`Erro não-bloqueante no envio de alerta Dead Letter: ${alertErr.message}`);
+    });
   }
 
   await event.save();

@@ -15,7 +15,7 @@ export async function createIntegration(data) {
     );
   }
 
-  // 2. Normaliza destinos (suporte a destination individual ou destinations array)
+  // 2. Normaliza destinos
   if (!data.destinations || data.destinations.length === 0) {
     if (data.destination) {
       data.destinations = [data.destination];
@@ -31,7 +31,12 @@ export async function createIntegration(data) {
     }
   }
 
-  // 4. Cria a integração
+  // 4. Valida alertWebhookUrl se informada
+  if (data.alertWebhookUrl) {
+    await validateDestinationUrl(data.alertWebhookUrl);
+  }
+
+  // 5. Cria a integração
   const integration = await Integration.create(data);
   return integration;
 }
@@ -100,7 +105,6 @@ export async function updateIntegration(id, updateData) {
     throw new AppError("Integração não encontrada.", 404, ERROR_CODES.INTEGRATION_NOT_FOUND);
   }
 
-  // Se estiver atualizando o slug, verifica unicidade
   if (updateData.slug && updateData.slug.toLowerCase() !== integration.slug) {
     const slugInUse = await Integration.findOne({
       slug: updateData.slug.toLowerCase(),
@@ -116,12 +120,19 @@ export async function updateIntegration(id, updateData) {
     integration.slug = updateData.slug.toLowerCase();
   }
 
-  // Atualiza campos gerais
   if (updateData.name) integration.name = updateData.name;
   if (updateData.description !== undefined) integration.description = updateData.description;
   if (typeof updateData.enabled === "boolean") integration.enabled = updateData.enabled;
   if (updateData.mapping !== undefined) integration.mapping = updateData.mapping;
+  if (updateData.filter !== undefined) integration.filter = updateData.filter;
   if (updateData.timeout) integration.timeout = updateData.timeout;
+
+  if (updateData.alertWebhookUrl !== undefined) {
+    if (updateData.alertWebhookUrl) {
+      await validateDestinationUrl(updateData.alertWebhookUrl);
+    }
+    integration.alertWebhookUrl = updateData.alertWebhookUrl;
+  }
 
   if (updateData.source) {
     if (updateData.source.authenticationType) {
@@ -135,7 +146,6 @@ export async function updateIntegration(id, updateData) {
     }
   }
 
-  // Atualiza destinos
   if (updateData.destinations && Array.isArray(updateData.destinations)) {
     for (const dest of updateData.destinations) {
       if (dest.url) {

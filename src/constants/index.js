@@ -4,6 +4,7 @@ export const EVENT_STATUS = {
   PROCESSING: "processing",
   RETRYING: "retrying",
   SUCCESS: "success",
+  SKIPPED: "skipped",
   FAILED: "failed",
   DEAD_LETTER: "dead_letter",
 };
@@ -13,6 +14,7 @@ export const DELIVERY_STATUS = {
   PROCESSING: "processing",
   RETRYING: "retrying",
   SUCCESS: "success",
+  SKIPPED: "skipped",
   FAILED: "failed",
   DEAD_LETTER: "dead_letter",
 };
